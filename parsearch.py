@@ -12,14 +12,20 @@ dump_archive(data) -- data: az archivum (bytes), a 0. offseten kezdodik
   None, ha a data elejen nincs (ervenyes) archivum, kulonben dict:
     type       "ZIP" | "RAR" | "RAR5" | "7z" | "CAB" | "NSIS" | "Inno Setup"
     size       az archivum merete (ami utana van, az nem resze, pl. digitalis alairas)
-    files      tartalomjegyzek: [[nev, meret, tomoritett meret, titkositott, modszer], ...]
+    files      tartalomjegyzek: [[nev, meret, tomoritett meret, titkositott, modszer, offset], ...]
                (ZIP, RAR, RAR5, 7z, CAB; a meretek None-ok lehetnek), None ha nem olvashato.
                A tomoritett meret tarolt (store) filenal = meret (titkositva a padding/fejlec miatt
                nagyobb); 7z solid folderben es CAB-ban None, mert ott nincs file szintu tomoritett meret.
                modszer: "store" = tomoritetlen; ZIP: "deflate","bzip2","lzma",... (AES eseten a valodi
                modszer), RAR: "m1".."m5", 7z: a coder lanc pl. "BCJ2+LZMA" / "LZMA2+AES", CAB: "MSZIP",
-               "LZX","Quantum". Ures filenal (7z) None. Konyvtarak nincsenek a listaban; symlink/hardlink
-               bejegyzesek fileként szerepelnek.
+               "LZX","Quantum". Ures filenal (7z) None.
+               offset: a file (tomoritett/titkositott) adatanak kezdete az archivum elejetol, vagy None
+               (7z: csak tarolt, titkositatlan folderben; CAB: None). Tarolt ("store") es titkositatlan
+               filenal data[offset:offset+meret] maga a file, igy rekurzivan vizsgalhato (csonka
+               archivumnal tulnyulhat a data vegen).
+               Konyvtarak nincsenek a listaban; symlink/hardlink bejegyzesek filekent szerepelnek,
+               modszer "link" (ZIP, 7z, RAR4: a tartalmuk a cel utvonala, az offset erre mutat;
+               RAR5: offset None, nincs sajat adata).
     encrypted  False, True (van jelszavas file), "headers" (a tartalomjegyzek is titkositott)
     comment    az archivum kommentje (RAR/ZIP; WinRAR SFX eseten itt vannak az SFX parancsok)
     sfx_script a kommentbol kiolvasott WinRAR SFX parancsok: {parancs: [ertekek]} vagy None
@@ -300,6 +306,8 @@ def _unescape_7z(v):
 
 MAX_FILES=100000
 
+MAX_MISMATCH_ERRORS=10
+
 def zip_details(data,start,end,errors):
     eocd=data.rfind(b"PK\5\6",start,end)
     sig,disk,cddisk,nent_disk,nent,cdsize,cdoff,clen=unpack("<IHHHHIIH",data,eocd)
@@ -312,27 +320,58 @@ def zip_details(data,start,end,errors):
     files=[]
     enc=False
     p=cdend-cdsize
+    delta=p-cdoff            # a ZIP offsetek -> file offset (zip -A / kivagott resz eseten is)
+    mismatch=0
     for i in range(min(nent,MAX_FILES)):
         if data[p:p+4]!=b"PK\1\2": break
+        madeby,=unpack("<H",data,p+4)
         flags,method=unpack("<HH",data,p+8)
         csize,usize,fnlen,xlen,cmlen=unpack("<IIHHH",data,p+20)
-        name=data[p+46:p+46+fnlen].decode("utf-8" if flags&0x800 else "cp437","replace")
+        extattr=u32(data,p+38)
+        lhoff=u32(data,p+42)
+        # symlink: Unix (3) vagy macOS (19) "made by" eseten a kulso attributum felso 16 bitje a mode
+        link=(madeby>>8) in (3,19) and is_unix_symlink(extattr>>16)
+        rawname=data[p+46:p+46+fnlen]
+        name=rawname.decode("utf-8","replace") if flags&0x800 else _decode_name(rawname)
         realmethod=method
         x=p+46+fnlen
-        while x+4<=p+46+fnlen+xlen:     # extra mezok: ZIP64 meretek, AES (a valodi modszer)
+        while x+4<=p+46+fnlen+xlen:     # extra mezok: ZIP64 meretek/offset, AES (a valodi modszer)
             xid,xsz=unpack("<HH",data,x)
-            if xid==1 and (usize==0xFFFFFFFF or csize==0xFFFFFFFF):
-                vals=list(unpack("<%dQ"%(min(xsz,16)//8),data,x+4))
+            if xid==1:
+                vals=list(unpack("<%dQ"%(min(xsz,24)//8),data,x+4))
                 if usize==0xFFFFFFFF and vals: usize=vals.pop(0)
                 if csize==0xFFFFFFFF and vals: csize=vals.pop(0)
+                if lhoff==0xFFFFFFFF and vals: lhoff=vals.pop(0)
             elif xid==0x9901 and xsz>=7:
                 realmethod=u16(data,x+4+5)
             x+=4+xsz
         e=bool(flags&1) or method==99
         enc|=e
+        # local header: az adat helye + osszevetes a central directory-val
+        # (az elteres ismert kijatszasi trukk: a viruskereso mast lat, mint a kicsomagolo)
+        off=None
+        lh=lhoff+delta
+        if data[lh:lh+4]==b"PK\3\4":
+            lver,lflags,lmethod,lt,ld,lcrc,lcsize,lusize,lfnlen,lxlen=unpack("<HHHHHIIIHH",data,lh+4)
+            off=lh+30+lfnlen+lxlen-start
+            diff=[]
+            if data[lh+30:lh+30+lfnlen]!=rawname: diff.append("name %r"%(data[lh+30:lh+30+lfnlen].decode("cp437","replace")))
+            if lmethod!=method: diff.append("method %d/%d"%(lmethod,method))
+            if not lflags&8 and 0xFFFFFFFF not in (lcsize,lusize) and (lcsize,lusize)!=(csize,usize):
+                diff.append("size %d/%d vs %d/%d"%(lusize,lcsize,usize,csize))
+            if diff:
+                mismatch+=1
+                if mismatch<=MAX_MISMATCH_ERRORS:
+                    errors.append("ZIP local header differs from central directory for %r: %s"%(name,", ".join(diff)))
+        else:
+            mismatch+=1
+            if mismatch<=MAX_MISMATCH_ERRORS:
+                errors.append("ZIP local header missing for %r"%(name))
         if not name.endswith("/"):      # konyvtar nem kell
-            files.append([name,usize,csize,e,zip_method_name(realmethod)])
+            files.append([name,usize,csize,e,"link" if link else zip_method_name(realmethod),off])
         p+=46+fnlen+xlen+cmlen
+    if mismatch>MAX_MISMATCH_ERRORS:
+        errors.append("ZIP local/central header mismatches: %d"%(mismatch))
     return files,enc,_decode_comment(comment)
 
 def zip_local_headers(data):
@@ -345,11 +384,11 @@ def zip_local_headers(data):
             ver,flags,method,mtime,mdate,crc,csize,usize,fnlen,xlen=unpack("<HHHHHIIIHH",data,p+4)
         except struct.error:
             break
-        name=data[p+30:p+30+fnlen].decode("utf-8" if flags&0x800 else "cp437","replace")
+        name=data[p+30:p+30+fnlen].decode("utf-8","replace") if flags&0x800 else _decode_name(data[p+30:p+30+fnlen])
         e=bool(flags&1) or method==99
         enc|=e
         if not name.endswith("/"):
-            files.append([name,None if flags&8 else usize,None if flags&8 else csize,e,zip_method_name(method)])
+            files.append([name,None if flags&8 else usize,None if flags&8 else csize,e,zip_method_name(method),p+30+fnlen+xlen])
         if flags&8: break               # data descriptor: a tomoritett meret nem ismert, nem lephetunk tovabb
         p+=30+fnlen+xlen+csize
     return files,enc
@@ -360,6 +399,60 @@ ZIP_METHODS={0:"store",1:"shrink",2:"reduce1",3:"reduce2",4:"reduce3",5:"reduce4
 
 def zip_method_name(m):
     return ZIP_METHODS.get(m,"m%d"%(m))
+
+S_IFMT,S_IFLNK=0o170000,0o120000
+
+def is_unix_symlink(mode):
+    return mode&S_IFMT==S_IFLNK
+
+def _decode_name(b):
+    """Kodolas jelzes nelkuli fajlnev: UTF-8, ha ervenyes (pl. Unix alatt keszult archivum), kulonben cp437."""
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("cp437","replace")
+
+def rar4_filename(raw,flags):
+    """RAR 1.5-4.x fajlnev. LHD_UNICODE (0x200) eseten: ha nincs benne 0 byte, UTF-8; kulonben
+    ASCII/OEM nev + 0 + tomoritett unicode valtozat (az unrar EncodeFileName::Decode algoritmusa)."""
+    if not flags&0x200:
+        return _decode_name(raw.split(b"\0")[0])
+    z=raw.find(b"\0")
+    if z<0:
+        return raw.decode("utf-8","replace")
+    name=raw[:z]; enc=raw[z+1:]
+    out=[]
+    try:
+        encpos=0
+        highbyte=enc[encpos]; encpos+=1
+        flagbyte=0; flagbits=0
+        while encpos<len(enc) and len(out)<1024:
+            if flagbits==0:
+                flagbyte=enc[encpos]; encpos+=1; flagbits=8
+            t=flagbyte>>6
+            if t==0:
+                out.append(enc[encpos]); encpos+=1
+            elif t==1:
+                out.append(enc[encpos]+(highbyte<<8)); encpos+=1
+            elif t==2:
+                out.append(enc[encpos]+(enc[encpos+1]<<8)); encpos+=2
+            else:
+                length=enc[encpos]; encpos+=1
+                if length&0x80:
+                    correction=enc[encpos]; encpos+=1
+                    for k in range((length&0x7F)+2):
+                        if len(out)>=len(name): break
+                        out.append(((name[len(out)]+correction)&0xFF)+(highbyte<<8))
+                else:
+                    for k in range(length+2):
+                        if len(out)>=len(name): break
+                        out.append(name[len(out)])
+            flagbyte=(flagbyte<<2)&0xFF; flagbits-=2
+    except IndexError:
+        pass
+    if not out:
+        return _decode_name(name)
+    return "".join(chr(c) if c<0xD800 or c>0xDFFF else "\ufffd" for c in out)
 
 def rar_method_name(m):
     """RAR tomoritesi szint: 0=store, 1..5 (fastest..best)"""
@@ -392,11 +485,12 @@ def rar4_details(data,start,end,errors):
             raw=data[q:q+nsize]
             add=psize
             if htype==0x74:
-                name=raw.split(b"\0")[0].decode("utf-8" if flags&0x200 else "cp437","replace").replace("\\","/")
+                name=rar4_filename(raw,flags).replace("\\","/")
                 e=bool(flags&0x04)
                 enc|=e
                 if flags&0xE0!=0xE0:     # konyvtar nem kell
-                    files.append([name,usize,psize,e,rar_method_name(method-0x30)])
+                    link=hostos==3 and is_unix_symlink(attr)   # Unix symlink: az adat a cel utvonala
+                    files.append([name,usize,psize,e,"link" if link else rar_method_name(method-0x30),p+hsize-start])
             elif raw==b"CMT":
                 if method==0x30:         # tarolt (nem tomoritett) komment
                     comment=_decode_comment(data[p+hsize:p+hsize+psize])
@@ -434,18 +528,21 @@ def rar5_details(data,start,end,errors):
             hostos,x=_vint(data,x)
             nlen,x=_vint(data,x)
             name=data[x:x+nlen].decode("utf-8","replace")
-            # extra terulet: 1 = file encryption rekord
+            # extra terulet: 1 = file encryption, 5 = redirection (symlink/junction/hardlink: nincs sajat adat)
             e=False
+            link=False
             xp=hend-xsize
             while xp<hend:
                 rsize,rp=_vint(data,xp)
                 rtype,rp2=_vint(data,rp)
                 if rtype==1: e=True
+                if rtype==5: link=True
                 xp=rp+rsize
             if htype==2:
                 enc|=e
                 if not fflags&1:         # konyvtar nem kell
-                    files.append([name,None if fflags&8 else usize,dsize,e,rar_method_name((cinfo>>7)&7)])
+                    if link: files.append([name,None if fflags&8 else usize,dsize,e,"link",None])
+                    else: files.append([name,None if fflags&8 else usize,dsize,e,rar_method_name((cinfo>>7)&7),hend-start])
             elif name=="CMT":
                 if (cinfo>>7)&7==0 and not e:
                     comment=_decode_comment(data[hend:hend+dsize])
@@ -480,7 +577,7 @@ def cab_details(data,start,end,errors):
         name=raw.replace("\\","/")
         if ifolder>=0xFFFD:          # elozo/kovetkezo cabinetbe atnyulo file: az elso/utolso folder
             ifolder=0 if ifolder in (0xFFFD,0xFFFF) else len(folder_methods)-1
-        files.append([name,fsize,None,False,folder_methods[ifolder] if ifolder<len(folder_methods) else None])
+        files.append([name,fsize,None,False,folder_methods[ifolder] if ifolder<len(folder_methods) else None,None])
         p+=16+len(raw.encode("utf-8" if fattr&0x80 else "cp437","replace"))+1
     return files,False,None
 
@@ -682,7 +779,7 @@ def sevenzip_details(data,start,end,errors):
         t=rd.num()
     if t!=0x01: raise ValueError("7z: kHeader expected (%d)"%(t))
     si=None
-    names=[]; empty=[]; emptyfile=[]; anti=[]
+    names=[]; empty=[]; emptyfile=[]; anti=[]; attrs=[]
     nfiles=0
     while True:
         t=rd.num()
@@ -707,13 +804,22 @@ def sevenzip_details(data,start,end,errors):
                     if rd.byte()!=0: raise ValueError("7z: external names not supported")
                     raw=rd.bytes(psize-1)
                     names=_sz_names(raw)
+                elif pt==0x15:                   # kAttributes
+                    defined=rd.defined(nfiles)
+                    if rd.byte()!=0: raise ValueError("7z: external attributes not supported")
+                    attrs=[]
+                    for dfn in defined:
+                        if dfn:
+                            attrs.append(unpack("<I",rd.d,rd.p)[0]); rd.p+=4
+                        else:
+                            attrs.append(None)
                 rd.p=pend
         else:
             raise ValueError("7z: bad Header property %d"%(t))
     # meretek: a nem ures stream-u fileok sorban kapjak a substream mereteket
     # tomoritett meret: csak az egy-fileos foldereknel ertelmezheto (a folder osszes pack streamje);
     # solid folderben a fileoknak nincs kulon tomoritett merete (None)
-    sizes=[]; folders_of=[]; packed=[]; methods=[]
+    sizes=[]; folders_of=[]; packed=[]; methods=[]; offsets=[]
     enc=False
     if si:
         pi=0
@@ -723,9 +829,13 @@ def sevenzip_details(data,start,end,errors):
             fpack=sum(si["packsizes"][pi:pi+f["npacked"]]) if pi+f["npacked"]<=len(si["packsizes"]) else None
             pi+=f["npacked"]
             fmethod=sz_method_name(f)
+            # tarolt (Copy, titkositatlan) folderben az adatok folytonosan, sorban vannak
+            fpos=base+si["packpos"]+sum(si["packsizes"][:pi-f["npacked"]])-start if fmethod=="store" else None
             for s in ss:
                 sizes.append(s); folders_of.append(fenc); packed.append(fpack if len(ss)==1 else None)
                 methods.append(fmethod)
+                offsets.append(fpos)
+                if fpos is not None: fpos+=s
     files=[]
     k=0
     ei=0
@@ -734,14 +844,18 @@ def sevenzip_details(data,start,end,errors):
         if empty and empty[i]:
             isdir=not (emptyfile[ei] if ei<len(emptyfile) else False)
             ei+=1
-            if not isdir: files.append([name,0,0,False,None])      # ures file: nincs adata, nincs modszer
+            if not isdir: files.append([name,0,0,False,None,None])      # ures file: nincs adata, nincs modszer
         else:
             s=sizes[k] if k<len(sizes) else None
             e=folders_of[k] if k<len(folders_of) else False
             pk=packed[k] if k<len(packed) else None
             m=methods[k] if k<len(methods) else None
+            of=offsets[k] if k<len(offsets) else None
             k+=1
-            files.append([name,s,pk,e,m])
+            a=attrs[i] if i<len(attrs) else None
+            # symlink: Unix kiterjesztes (0x8000, felso 16 bit = mode) vagy Windows reparse point (0x400)
+            if a is not None and ((a&0x8000 and is_unix_symlink(a>>16)) or a&0x400): m="link"
+            files.append([name,s,pk,e,m,of])
     return files,enc,None
 
 def _sz_names(raw):
