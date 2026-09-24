@@ -43,14 +43,14 @@ a = parsearch.dump_archive(data)       # önálló archívum (a 0. offseten kezd
 - MZ (DOS), beleértve a PKLITE, LZEXE és DIET packer-tippeket;
 - PE32/PE32+ (x86, x64, ARM64 és a többi gép), .NET is;
 - NE (16 bites Windows/OS2), LE/LX (DOS extender, OS/2, VxD);
-- LC (DOS/32A tömörített), DJGPP COFF;
+- LC (DOS/32A tömörített), BW (DOS/16M, pl. DOS/4GW), DJGPP COFF;
 - ELF (32/64 bit, little/big endian).
 
 **Közös mezők:**
 
 | Mező | Jelentés |
 |---|---|
-| `type` | `"MZ"` `"PE"` `"NE"` `"LE"` `"LX"` `"LC"` `"COFF"` `"ELF"` |
+| `type` | `"MZ"` `"PE"` `"NE"` `"LE"` `"LX"` `"LC"` `"BW"` `"COFF"` `"ELF"` |
 | `size` | az exe része a fájl elejétől (aláírással, debug infóval, szimbólumtáblával együtt); ami utána van, az overlay |
 | `truncated` | a fájl rövidebb, mint amit a fejlécek szerint tartalmaznia kellene |
 | `overlay` | az exe utáni adat típusa (`"ZIP"`, `"RAR"`, `"7z"`, `"NSIS"`, `"Inno Setup"`, `"MZ"`, `"zero padding"`, `"unknown"`...) vagy `None` |
@@ -62,6 +62,8 @@ a = parsearch.dump_archive(data)       # önálló archívum (a 0. offseten kezd
 Az archívum-keresés az SFX-trükköket is kezeli: szemét vagy konfig az archívum előtt,
 digitális aláírás utána, exe-be ágyazott archívum (ekkor `archive_start < size`), `zip -A`-val
 igazított ZIP.
+
+**MZ:** `packer` (tipp: PKLITE, LZEXE, DIET), `extender` (ha maga a DOS program egy DOS extender stub vagy runtime, pl. egy kötetlen `DOS32A.EXE` vagy PMODE/W stub).
 
 **PE:**
 - alapadatok: `bits`, `machine`, `subsystem`, `dll`;
@@ -75,7 +77,13 @@ igazított ZIP.
 
 **NE/LE/LX:** `bits`, `os`, `module`, `imports` (NE-nél a relokációkból az importált függvényekkel együtt).
 
-**LC:** `objects`, `oem`.
+**LE/LX:** `extender`: a stub alapján felismert DOS extender (`"DOS/4GW"`, `"DOS/32A"`, `"PMODE/W"`, `"CauseWay"`, `"WDOSX"`); ilyenkor az `os` értéke `"dos"`, az `os_header` pedig megőrzi a fejléc OS mezőjét (DOS extenderes programoknál általában `"os2"`, mert pl. a Watcom linker OS/2 formátumú LE-t ír).
+
+**LC:** `objects`, `oem`, `extender` (`"DOS/32A"`).
+
+**BW** (DOS/16M, pl. maga a DOS/4GW kernel): `extender`, `images` (a láncolt image-ek száma), `bound_app` (ha a lánc egy LE/LX alkalmazásba torkollik).
+
+**Hozzáfűzött debug info:** `debug` = `"DWARF"` (Open Watcom, TIS trailer ELF konténerrel), `"Watcom"` (régi Watcom formátum), `"CodeView NB09"`...; ha közvetlenül az exe után áll, a `size` tartalmazza.
 
 ## parsearch
 

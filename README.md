@@ -43,14 +43,14 @@ a = parsearch.dump_archive(data)       # standalone archive (starting at offset 
 - MZ (DOS), including PKLITE, LZEXE and DIET packer hints;
 - PE32/PE32+ (x86, x64, ARM64 and other machines), including .NET;
 - NE (16-bit Windows/OS2), LE/LX (DOS extenders, OS/2, VxD);
-- LC (DOS/32A compressed), DJGPP COFF;
+- LC (DOS/32A compressed), BW (DOS/16M, e.g. DOS/4GW), DJGPP COFF;
 - ELF (32/64-bit, little/big endian).
 
 **Common fields:**
 
 | Field | Meaning |
 |---|---|
-| `type` | `"MZ"` `"PE"` `"NE"` `"LE"` `"LX"` `"LC"` `"COFF"` `"ELF"` |
+| `type` | `"MZ"` `"PE"` `"NE"` `"LE"` `"LX"` `"LC"` `"BW"` `"COFF"` `"ELF"` |
 | `size` | the executable part from the start of the file (including signature, debug info, symbol table); anything after it is the overlay |
 | `truncated` | the file is shorter than the headers say it should be |
 | `overlay` | type of the data after the executable (`"ZIP"`, `"RAR"`, `"7z"`, `"NSIS"`, `"Inno Setup"`, `"MZ"`, `"zero padding"`, `"unknown"`...) or `None` |
@@ -62,6 +62,8 @@ a = parsearch.dump_archive(data)       # standalone archive (starting at offset 
 The archive search also handles SFX tricks: junk or a config block before the archive, a digital
 signature after it, an archive embedded inside the executable (then `archive_start < size`), and
 ZIPs adjusted with `zip -A`.
+
+**MZ:** `packer` (hint: PKLITE, LZEXE, DIET), `extender` (if the DOS program itself is a DOS extender stub or runtime, e.g. an unbound `DOS32A.EXE` or PMODE/W stub).
 
 **PE:**
 - basics: `bits`, `machine`, `subsystem`, `dll`;
@@ -75,7 +77,13 @@ ZIPs adjusted with `zip -A`.
 
 **NE/LE/LX:** `bits`, `os`, `module`, `imports` (for NE, including imported functions taken from the relocations).
 
-**LC:** `objects`, `oem`.
+**LE/LX:** `extender`: the DOS extender detected from the stub (`"DOS/4GW"`, `"DOS/32A"`, `"PMODE/W"`, `"CauseWay"`, `"WDOSX"`); in that case `os` is `"dos"`, while `os_header` keeps the OS field from the header (usually `"os2"` for DOS extender programs, since e.g. the Watcom linker writes OS/2-style LE files).
+
+**LC:** `objects`, `oem`, `extender` (`"DOS/32A"`).
+
+**BW** (DOS/16M, e.g. the DOS/4GW kernel itself): `extender`, `images` (number of chained images), `bound_app` (if the chain ends in an LE/LX application).
+
+**Appended debug info:** `debug` = `"DWARF"` (Open Watcom, TIS trailer with an ELF container), `"Watcom"` (old Watcom format), `"CodeView NB09"`...; if it directly follows the executable, it is included in `size`.
 
 ## parsearch
 

@@ -4,7 +4,7 @@ DOS/Windows futtathato fileok (MZ, PE, NE, LE/LX, LC, DJGPP COFF) es ELF (Linux/
 
 dump_exe(data) -- data: a teljes file tartalma (bytes)
   None, ha nem (ertelmezheto) EXE, kulonben dict:
-    type      "MZ" | "PE" | "NE" | "LE" | "LX" | "LC" | "COFF" | "ELF"
+    type      "MZ" | "PE" | "NE" | "LE" | "LX" | "LC" | "BW" | "COFF" | "ELF"
     size      az exe resz merete a file elejetol; ami utana van, az overlay
               (SFX archiv, installer adat, stb.)
     overlay   az exe utani adat tipusa ("ZIP","RAR","7z","CAB","NSIS","Inno Setup",
@@ -34,6 +34,13 @@ dump_exe(data) -- data: a teljes file tartalma (bytes)
       imports        [[assembly, "Namespace.Tipus", ...], ...]   (TypeRef-ek)
       pinvoke        [[dll, fuggveny, ...], ...]                  (natív DllImport-ok)
   NE/LE/LX eseten meg: bits, os, module (modulnev)
+  MZ eseten meg: packer (tipp), extender (ha maga a DOS program egy DOS extender stub/runtime)
+  LE/LX eseten meg: extender (DOS extender a stub alapjan: "DOS/4GW","DOS/32A","PMODE/W",...,
+    ilyenkor os="dos"), os_header (a fejlec OS mezoje, DOS extendereknel altalaban "os2")
+  debug     a file vegere fuzott debug info formatuma ("DWARF","Watcom","CodeView NB09",...), ha van
+            (ilyenkor a size ezt is tartalmazza)
+  BW (DOS/16M, pl. a DOS/4GW kernel) eseten meg: bits, os, extender, images (a lancolt image-ek szama),
+    bound_app (ha a lanc egy LE/LX alkalmazasba torkollik)
   LC (DOS/32A tomoritett) eseten meg: bits, os, packer, objects (objektumok szama), oem (OEM szoveg, ha van)
   ELF eseten meg: bits, endian, machine, os (EI_OSABI), elf_type ("EXEC","DYN","REL",...),
     interpreter (PT_INTERP), soname, dll (shared library), packer ("UPX"),
@@ -101,6 +108,8 @@ def detect_overlay(data,off):
     if d[4:8]==b"\xef\xbe\xad\xde" and d[8:20]==b"NullsoftInst": return "NSIS"
     if d.startswith(b"zlb\x1a") or d.startswith(b"idska32\x1a"): return "Inno Setup"
     if d.startswith(b"MZ"): return "MZ"
+    if d.startswith(b"\x7fELF"): return "ELF"
+    if d.startswith(b"BW"): return "BW"
     if d.startswith(b"%PDF"): return "PDF"
     if d.startswith(b"FBOV"): return "Borland overlay"
     if len(d)>=10 and d[4:6]==b"\0\x02" and d[8:10]==b"\x30\x82": return "certificate"
@@ -751,10 +760,23 @@ def dump_ne(data,ne):
 
 LE_OS={0:"unknown",1:"os2",2:"windows",3:"dos4",4:"win386"}
 
+# DOS extenderek a stubban (a sorrend szamit: a DOS/32A stub a DOS/4G szoveget is tartalmazza)
+DOS_EXTENDERS=((b"DOS/32A","DOS/32A"),(b"STUB/32A","DOS/32A"),(b"STUB/32C","DOS/32A"),(b"DOS32A.EXE","DOS/32A"),
+    (b"PMODE/W","PMODE/W"),(b"CauseWay","CauseWay"),(b"WDOSX","WDOSX"),
+    (b"DOS4GPATH","DOS/4GW"),(b"DOS/4G","DOS/4GW"),(b"dos4gw.exe","DOS/4GW"))
+
+def dos_extender(stub):
+    for sig,name in DOS_EXTENDERS:
+        if sig in stub: return name
+    return None
+
 def dump_lx(data,h,kind):
     r={"type":kind,"bits":32,"errors":[]}
     g=lambda o: u32(data,h+o)
-    r["os"]=LE_OS.get(u16(data,h+0x0A),str(u16(data,h+0x0A)))
+    r["os"]=r["os_header"]=LE_OS.get(u16(data,h+0x0A),str(u16(data,h+0x0A)))
+    # a DOS extenderes programok fejleceben tipikusan OS/2 all (Watcom), valojaban DOS alatt futnak
+    r["extender"]=dos_extender(data[:h])
+    if r["extender"]: r["os"]="dos"
     npages,psize,last_or_shift=g(0x14),g(0x28),g(0x2C)
     datapages=g(0x80)
     size=h+0xB0
@@ -774,7 +796,12 @@ def dump_lx(data,h,kind):
                 break
             if pflags in (0,1,5) and plen:   # fizikai, iteralt, tomoritett lap
                 base=iterpages if pflags==1 else datapages
-                size=max(size,base+(poff<<last_or_shift)+plen)
+                pend=base+(poff<<last_or_shift)+plen
+                # a Watcom linker a lap hosszat a lapeltolas igazitasara kerekiti: az utolso lap
+                # legfeljebb egy igazitasi egyseggel tulnyulhat a file vegen (a loader nullakkal tolti)
+                if len(data)<pend<len(data)+(1<<last_or_shift) and base+(poff<<last_or_shift)<len(data):
+                    pend=len(data)
+                size=max(size,pend)
     if g(0x88) and g(0x8C):   # non-resident names
         size=max(size,g(0x88)+g(0x8C))
     if g(0x98) and g(0x9C):   # debug info
@@ -819,7 +846,7 @@ def dump_lx(data,h,kind):
 LC_SPECVER=4
 
 def dump_lc(data,h):
-    r={"type":"LC","bits":32,"os":"dos","packer":"DOS/32A SC","imports":None,"errors":[]}
+    r={"type":"LC","bits":32,"os":"dos","extender":"DOS/32A","packer":"DOS/32A SC","imports":None,"errors":[]}
     nobj,flags,eipobj,espobj,eip,esp=unpack("<BBBBII",data,h+4)
     if flags&0x0F!=LC_SPECVER:
         r["errors"].append("unsupported LC version: %d"%(flags&0x0F))
@@ -843,6 +870,45 @@ def dump_lc(data,h):
         p=end+1
     r["objects"]=nobj
     r["size"]=p
+    return r
+
+
+#####################################################################
+#   DOS/16M "BW" (Rational Systems / Tenberry; a DOS/4GW kernel is ilyen)
+#   Open Watcom exe16m.h: dos16m_exe_header: "BW", last_page_bytes, pages_in_file (mint az MZ),
+#   ... 0x1C next_header_pos (a kovetkezo hozzafuzott .EXP image file pozicioja),
+#   0x20 cv_info_offset (debug info az image elejetol), 0x30+4 exp_flags (0x8000: DOS/4G)
+#####################################################################
+
+def dump_bw(data,pos):
+    r={"type":"BW","bits":16,"os":"dos","imports":None,"errors":[]}
+    r["extender"]=dos_extender(data[:pos]) or "DOS/16M"
+    p=pos; images=0; end=pos; seen=set()
+    while p is not None and p not in seen and images<256:
+        seen.add(p)
+        if data[p:p+2]!=b"BW":
+            if data[p:p+2] in (b"LE",b"LX"):
+                # a lanc egy (4GWBIND-dal kotott) LE/LX alkalmazasba torkollik
+                app=dump_lx(data,p,data[p:p+2].decode())
+                r["bound_app"]=app["type"]
+                for k in ("module","imports"): r[k]=app.get(k)
+                r["errors"]+=app["errors"]
+                end=max(end,app["size"])
+            break
+        last,pages=unpack("<HH",data,p+2)
+        nxt,cv=unpack("<II",data,p+0x1C)
+        flags=u16(data,p+0x34)
+        if flags&0x8000: r["extender"]="DOS/4GW"
+        isize=pages*512-((512-last) if last else 0)
+        images+=1
+        end=max(end,p+isize,p+cv if cv else 0)
+        if not nxt or nxt<=p or nxt>=len(data): 
+            if nxt>p: end=max(end,min(nxt,len(data)))
+            break
+        end=max(end,nxt)
+        p=nxt
+    r["images"]=images
+    r["size"]=end
     return r
 
 
@@ -1142,6 +1208,12 @@ def dump_exe(data):
             coffsize=dump_coff(data,mzsize)
             if coffsize:
                 r={"type":"COFF","size":mzsize+coffsize,"imports":None,"errors":[]}
+        if r is None and data[mzsize:mzsize+2]==b"BW":
+            try:
+                r=dump_bw(data,mzsize)
+            except Exception as e:
+                log(0,"exc:bw: %r"%(e))
+                r={"type":"BW","size":mzsize,"imports":None,"errors":["BW parse error: %s"%(e)]}
         if r is None and ne_off>=0x40 and sig[:2] in (b"NE",b"LE",b"LX",b"LC"):
             kind=sig[:2].decode()
             try:
@@ -1153,10 +1225,37 @@ def dump_exe(data):
                 r={"type":kind,"size":max(mzsize,ne_off),"imports":None,"errors":["%s parse error: %s"%(kind,e)]}
         if r is None:
             r={"type":"MZ","size":mzsize,"imports":None,"errors":[],"packer":dos_packer(data)}
+            # maga a DOS program egy extender (kotetlen stub vagy runtime, pl. DOS32A.EXE, PMODE/W stub)
+            ext=dos_extender(data[:mzsize])
+            if ext: r["extender"]=ext
     return finish_result(data,r)
+
+def appended_debug(data,size):
+    """A file vegere fuzott debug info (Watcom/DOS linkerek): (formatum, kezdete) vagy None.
+    TIS (Tool Interface Standard) trailer: "TIS\0" ... u32 meret a file vegen (DWARF: ELF konteiner);
+    regi Watcom: 0x8386 szignaturaju master header a file vegen, u32 debug_size;
+    CodeView: "NB0x"/"NB1x" + u32 offset a file vegen."""
+    n=len(data)
+    if n-size<16: return None
+    t=data[-16:]
+    if t[:4]==b"TIS\0":
+        start=n-u32(data,n-4)
+        if start>=0:
+            return ("DWARF" if data[start:start+4]==b"\x7fELF" else "TIS"),start
+    if u16(data,n-14)==0x8386:
+        start=n-u32(data,n-4)
+        if start>=0: return "Watcom",start
+    if data[n-8:n-6]==b"NB" and data[n-6:n-4].isdigit():
+        start=n-u32(data,n-4)
+        if start>=0 and data[start:start+4]==data[n-8:n-4]: return "CodeView "+data[n-8:n-4].decode(),start
+    return None
 
 def finish_result(data,r):
     """Kozos resz: csonkolas, overlay, archivum keresese."""
+    dbg=appended_debug(data,r["size"])
+    if dbg and 0<=dbg[1]-r["size"]<16:   # kozvetlenul (igazitassal) az exe utan: az exe resze
+        r["debug"]=dbg[0]
+        r["size"]=len(data)
     r["truncated"]=r["size"]>len(data)
     r["overlay"]=detect_overlay(data,r["size"])
     try:
@@ -1209,6 +1308,9 @@ def short(ret):
     if ret.get("bits"): s+=" %dbit"%(ret["bits"])
     if ret.get("dll"): s+=" DLL"
     if ret.get("os"): s+=" os=%s"%(ret["os"])
+    if ret.get("extender"): s+=" extender=%s"%(ret["extender"])
+    if ret.get("images"): s+=" images=%d"%(ret["images"])
+    if ret.get("debug"): s+=" debug=%s"%(ret["debug"])
     if ret.get("packer"): s+=" packer=%s"%(ret["packer"])
     if ret.get("overlay"): s+=" overlay=%s"%(ret["overlay"])
     if ret.get("archive"):
