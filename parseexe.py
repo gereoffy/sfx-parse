@@ -92,6 +92,7 @@ def detect_overlay(data,off):
     if d.startswith(b"PK\3\4") or d.startswith(b"PK\5\6"): return "ZIP"
     if d.startswith(b"Rar!\x1a\x07\x01\x00"): return "RAR5"
     if d.startswith(b"Rar!\x1a\x07"): return "RAR"
+    if d.startswith(b"RE~^"): return "RAR14"
     if d.startswith(b"7z\xbc\xaf\x27\x1c"): return "7z"
     if d.startswith(b"MSCF"): return "CAB"
     if d.startswith(b"\xfd7zXZ\0"): return "XZ"

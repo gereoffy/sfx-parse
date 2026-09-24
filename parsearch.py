@@ -10,10 +10,14 @@ archiv fileokra es SFX exe-kbol kivagott archivumokra is hasznalhato, pl.:
 
 dump_archive(data) -- data: az archivum (bytes), a 0. offseten kezdodik
   None, ha a data elejen nincs (ervenyes) archivum, kulonben dict:
-    type       "ZIP" | "RAR" | "RAR5" | "7z" | "CAB" | "NSIS" | "Inno Setup"
+    type       "ZIP" | "RAR" (1.5-4.x) | "RAR5" | "RAR14" (1.3/1.4) | "7z" | "CAB" | "NSIS" | "Inno Setup"
     size       az archivum merete (ami utana van, az nem resze, pl. digitalis alairas)
     files      tartalomjegyzek: [[nev, meret, tomoritett meret, titkositott, modszer, offset], ...]
-               (ZIP, RAR, RAR5, 7z, CAB; a meretek None-ok lehetnek), None ha nem olvashato.
+               (ZIP, RAR, RAR5, 7z, CAB, NSIS; a meretek None-ok lehetnek), None ha nem olvashato.
+               NSIS: a telepito szkript fajljai (File / WriteUninstaller), $INSTDIR elotag nelkul,
+               a pluginok $PLUGINSDIR/... alakban; nem solid tomoritett filenal a meret None (csak a
+               tomoritett meret ismert), solid telepitonel a tomoritett meret es az offset None.
+               Inno Setup-nal nincs tartalomjegyzek.
                A tomoritett meret tarolt (store) filenal = meret (titkositva a padding/fejlec miatt
                nagyobb); 7z solid folderben es CAB-ban None, mert ott nincs file szintu tomoritett meret.
                modszer: "store" = tomoritetlen; ZIP: "deflate","bzip2","lzma",... (AES eseten a valodi
@@ -28,7 +32,9 @@ dump_archive(data) -- data: az archivum (bytes), a 0. offseten kezdodik
                RAR5: offset None, nincs sajat adata).
     encrypted  False, True (van jelszavas file), "headers" (a tartalomjegyzek is titkositott)
     comment    az archivum kommentje (RAR/ZIP; WinRAR SFX eseten itt vannak az SFX parancsok)
-    sfx_script a kommentbol kiolvasott WinRAR SFX parancsok: {parancs: [ertekek]} vagy None
+    sfx_script a kommentbol kiolvasott WinRAR SFX parancsok: {parancs: [ertekek]} vagy None;
+               NSIS eseten a telepito szkript: {"Exec": [parancssorok], "ShellExec": ["verb file params"],
+               "Plugin": ["dll::fuggveny"]}
     errors     elemzes kozben talalt hibak/anomaliak
     truncated  True, ha a data rovidebb, mint az archivum a fejlec szerint
 
@@ -140,8 +146,10 @@ def _rar4_end(data,start,hi):
         hcrc,htype,flags,hsize=unpack("<HBHH",data,p)
         if hsize<7 or htype<0x72 or htype>0x7B: break
         if zlib.crc32(data[p+2:p+hsize])&0xFFFF!=hcrc:
-            if first: return None      # a main header CRC-je nem stimmel: nem RAR
-            break
+            # RAR 1.5-2.x: a main headerbe agyazott kommentnel a CRC csak a fix 13 byte-ra vonatkozik
+            if not (htype==0x73 and flags&0x02 and hsize>=13 and zlib.crc32(data[p+2:p+13])&0xFFFF==hcrc):
+                if first: return None      # a main header CRC-je nem stimmel: nem RAR
+                break
         if first and htype!=0x73: return None
         if first and flags&0x80: return hi   # MHD_PASSWORD: titkositott fejlecek, nem jarhato be
         first=False
@@ -177,6 +185,27 @@ def _rar5_end(data,start,hi):
         if htype==5: break             # end of archive
     return None if first else min(p,hi)
 
+def _rar14_headers(data,start,hi):
+    """RAR 1.3/1.4 ("RE~^"): (main header meret, flags, [(pos,hsize,psize,usize,attr,flags,method,name)], vege)
+    vagy None ha nem ervenyes. A fajlfejlec: PackSize u32, UnpSize u32, CRC u16, HeadSize u16, FileTime u32,
+    Attr u8, Flags u8, UnpVer u8, NameSize u8, Method u8, nev."""
+    if start+7>hi: return None
+    mhs,mflags=unpack("<HB",data,start+4)
+    if mhs<7: return None
+    p=start+mhs
+    entries=[]
+    while p+21<=hi and len(entries)<MAX_FILES:
+        psize,usize,crc,hsize,ftime,attr,fflags,uver,nsize,method=unpack("<IIHHIBBBBB",data,p)
+        if hsize<21+nsize or method>5 or uver not in (1,2): break
+        entries.append((p,hsize,psize,usize,attr,fflags,method,data[p+21:p+21+nsize]))
+        p+=hsize+psize
+    if not entries and p!=hi: return None     # se fajl, se pontos vege: valoszinuleg nem RAR 1.x
+    return mhs,mflags,entries,p
+
+def _rar14_end(data,start,hi):
+    h=_rar14_headers(data,start,hi)
+    return None if h is None else h[3]
+
 def _7z_end(data,start,hi):
     if start+32>hi: return None
     vmaj,vmin,crc,nextoff,nextsize,nextcrc=unpack("<BBIQQI",data,start+6)
@@ -202,6 +231,7 @@ def _nsis_end(data,start,hi):
 ARCHIVE_SIGS=(
     ("RAR5",b"Rar!\x1a\x07\x01\x00",0,_rar5_end),
     ("RAR",b"Rar!\x1a\x07\x00",0,_rar4_end),
+    ("RAR14",b"RE~^",0,_rar14_end),
     ("7z",b"7z\xbc\xaf\x27\x1c",0,_7z_end),
     ("CAB",b"MSCF\0\0\0\0",0,_cab_end),
     ("NSIS",b"\xef\xbe\xad\xdeNullsoftInst",4,_nsis_end),
@@ -475,8 +505,13 @@ def rar4_details(data,start,end,errors):
         if htype==0x73:
             if flags&0x80:       # MHD_PASSWORD: a fejlecek titkositottak
                 return None,"headers",None
-            if flags&0x02:
-                errors.append("RAR4 old style (compressed) comment not decoded")
+            if flags&0x02 and hsize>=13+15:
+                # RAR 1.5-2.x: komment alblokk (0x75) a main headerben: UnpSize u16, UnpVer, Method, CRC, adat
+                chcrc,chtype,chflags,chsize,cusize,cver,cmethod,ccrc=unpack("<HBHHHBBH",data,p+13)
+                if chtype==0x75 and cmethod==0x30:
+                    comment=_decode_comment(data[p+13+15:p+13+chsize])
+                else:
+                    errors.append("RAR old style comment is compressed, not decoded")
         elif htype in (0x74,0x7A):
             psize,usize,hostos,fcrc,ftime,uver,method,nsize,attr=unpack("<IIBIIBBHI",data,p+7)
             q=p+32
@@ -500,6 +535,24 @@ def rar4_details(data,start,end,errors):
             add=u32(data,p+7)
         p+=hsize+add
         if htype==0x7B: break
+    return files,enc,comment
+
+def rar14_details(data,start,end,errors):
+    mhs,mflags,entries,p=_rar14_headers(data,start,end)
+    comment=None
+    if mflags&0x02 and mhs>=9:                 # komment a main headerben
+        clen=u16(data,start+7)
+        if mflags&0x10:
+            errors.append("RAR 1.x comment is compressed, not decoded")
+        else:
+            comment=_decode_comment(data[start+9:start+9+min(clen,mhs-9)])
+    files=[]
+    enc=False
+    for pos,hsize,psize,usize,attr,fflags,method,rawname in entries:
+        e=bool(fflags&0x04)
+        enc|=e
+        if attr&0x10: continue                 # konyvtar
+        files.append([_decode_name(rawname).replace("\\","/"),usize,psize,e,rar_method_name(method),pos+hsize-start])
     return files,enc,comment
 
 def rar5_details(data,start,end,errors):
@@ -869,7 +922,269 @@ def _sz_names(raw):
             cur+=ch
     return names
 
-ARCHIVE_DETAILS={"ZIP":zip_details,"RAR":rar4_details,"RAR5":rar5_details,"CAB":cab_details,"7z":sevenzip_details}
+#####################################################################
+#   NSIS (Nullsoft Scriptable Install System) telepito adat
+#
+#   firstheader (28 byte): flags, 0xDEADBEEF, "NullsoftInst", header hossz (kicsomagolva),
+#   az osszes adat hossza. Utana:
+#     nem solid: [u32 meret (bit31: tomoritett)][header] majd fileonkent [u32 meret][adat]
+#     solid:     egyetlen tomoritett stream: [u32 header hossz][header][u32 meret][adat]...
+#   tomorites: raw deflate (zlib), NSIS-bzip2 (stream fejlec nelkul) vagy LZMA (opcionalis x86 BCJ).
+#   A fajlnevek a telepito szkriptben vannak: EW_EXTRACTFILE utasitasok + string tabla,
+#   a konyvtarat a SetOutPath (EW_CREATEDIR) adja.
+#####################################################################
+
+NSIS_EW_CREATEDIR=11
+NSIS_EW_EXTRACTFILE=20
+NSIS_EW_WRITEUNINSTALLER=62
+NSIS_EW_SHELLEXEC=40      # ExecShell: parm0 verb, parm1 file, parm2 parameters
+NSIS_EW_EXECUTE=41        # Exec/ExecWait: parm0 parancssor
+NSIS_EW_REGISTERDLL=44    # plugin hivas / RegDLL: parm0 dll, parm1 fuggveny
+NSIS_MAX_SCRIPT=1000      # parancsonkent legfeljebb ennyi elem
+NSIS_MAX_SOLID=256*1024*1024     # solid streambol legfeljebb ennyit bontunk ki a fajlmeretek miatt
+NSIS_MAX_SOLID_BZIP2=16*1024*1024   # a tiszta Python bzip2 lassu (~1 MB/s), ott kisebb a korlat
+NSIS_MAX_HEADER=64*1024*1024
+# beepitett valtozok (a $0..$9, $R0..$R9 utan)
+NSIS_VARS=["CMDLINE","INSTDIR","OUTDIR","EXEDIR","LANGUAGE","TEMP","PLUGINSDIR","EXEPATH","EXEFILE",
+    "HWNDPARENT","_CLICK","_OUTDIR"]
+# shell mappak (CSIDL) -> NSIS nev
+NSIS_SHELL={0x00:"DESKTOP",0x02:"SMPROGRAMS",0x05:"DOCUMENTS",0x06:"FAVORITES",0x07:"SMSTARTUP",
+    0x08:"RECENT",0x09:"SENDTO",0x0B:"STARTMENU",0x0D:"MUSIC",0x0E:"VIDEOS",0x10:"DESKTOP",
+    0x13:"NETHOOD",0x14:"FONTS",0x15:"TEMPLATES",0x1A:"APPDATA",0x1C:"LOCALAPPDATA",0x1B:"PRINTHOOD",
+    0x20:"INTERNET_CACHE",0x21:"COOKIES",0x22:"HISTORY",0x23:"APPDATA",0x24:"WINDIR",0x25:"SYSDIR",
+    0x26:"PROGRAMFILES",0x27:"PICTURES",0x2B:"COMMONFILES",0x2D:"TEMPLATES",0x30:"ADMINTOOLS",
+    0x3B:"CDBURN_AREA"}
+
+def _nsis_bzip2():
+    """Az NSIS bzip2 dekoder a kulon bzip2dec.py-bol (tiszta Python)."""
+    import bzip2dec
+    return bzip2dec.NsisBzip2Decompressor()
+
+def _nsis_lzma_props(data,q):
+    """LZMA stream kezdete: (props offset, x86 szuro) vagy None"""
+    # LZMA fejlec: 5D (lc=3,lp=0,pb=2), szotarmeret u32 (also 16 bit 0), utana az elso byte felso bitje 0
+    def ok(i): return data[i:i+3]==b"\x5d\x00\x00" and len(data)>i+6 and data[i+5]==0 and not data[i+6]&0x80
+    if ok(q): return q,False
+    if data[q:q+1] in (b"\x00",b"\x01") and ok(q+1): return q+1,data[q]==1   # opcionalis x86 BCJ szuro
+    return None
+
+class _StreamReader:
+    """Tomoritett stream sorban olvasasa (lzma/bz2/zlib decompressor objektummal), a tartalom eldobasaval."""
+    def __init__(self,dec,src,kind):
+        self.dec=dec; self.src=src; self.kind=kind
+        self.limit=NSIS_MAX_SOLID_BZIP2 if kind=="bz2" else NSIS_MAX_SOLID
+        self.pos=0; self.buf=b""; self.fed=False; self.eof=False
+    def _more(self,n):
+        if self.kind=="zlib":
+            src=self.src if not self.fed else self.dec.unconsumed_tail
+            self.fed=True
+            out=self.dec.decompress(src,n)
+            if not out and not self.dec.unconsumed_tail: self.eof=True
+        else:
+            if self.dec.eof: self.eof=True; return b""
+            out=self.dec.decompress(b"" if self.fed else self.src,max_length=n)
+            self.fed=True
+            if not out and self.dec.needs_input: self.eof=True
+        return out
+    def read_at(self,target,n):
+        """n byte a kibontott stream target poziciojan (target >= az elozo keres vege)"""
+        while self.pos+len(self.buf)<target+n and not self.eof:
+            if self.pos+len(self.buf)>self.limit: raise ValueError("NSIS solid stream too big for listing (>%d MB)"%(self.limit>>20))
+            chunk=self._more(1<<20)
+            self.buf+=chunk
+            if target>self.pos+len(self.buf):       # a celpozicio elotti reszt eldobjuk
+                self.pos+=len(self.buf); self.buf=b""
+            else:
+                self.buf=self.buf[target-self.pos:]; self.pos=target
+        if target<self.pos or self.pos+len(self.buf)<target+n: return None
+        return self.buf[target-self.pos:target-self.pos+n]
+
+def _nsis_decoder(data,q,end,method):
+    """Uj decompressor a q-n kezdodo streamhez (a mar megallapitott modszerrel)"""
+    import lzma
+    if "lzma" in method:
+        pq,x86=_nsis_lzma_props(data,q)
+        d=data[pq]; lc=d%9; d//=9; lpp=d%5; pb=d//5
+        filters=[{"id":lzma.FILTER_LZMA1,"dict_size":max(4096,u32(data,pq+1)),"lc":lc,"lp":lpp,"pb":pb}]
+        if x86: filters.insert(0,{"id":lzma.FILTER_X86})
+        return _StreamReader(lzma.LZMADecompressor(format=lzma.FORMAT_RAW,filters=filters),data[pq+5:end],"lzma")
+    if method=="bzip2":
+        return _StreamReader(_nsis_bzip2(),data[q:end],"bz2")
+    return _StreamReader(zlib.decompressobj(-15),data[q:end],"zlib")
+
+def _nsis_decompress(data,q,end,maxlen):
+    """Egy NSIS tomoritett stream kibontasa (legfeljebb maxlen byte). Visszaad: (modszer, adat) vagy None"""
+    import lzma
+    buf=data[q:end]
+    lp=_nsis_lzma_props(data,q)
+    if lp:
+        pq,x86=lp
+        d=data[pq]; lc=d%9; d//=9; lpp=d%5; pb=d//5
+        filters=[{"id":lzma.FILTER_LZMA1,"dict_size":max(4096,u32(data,pq+1)),"lc":lc,"lp":lpp,"pb":pb}]
+        if x86: filters.insert(0,{"id":lzma.FILTER_X86})
+        try:
+            out=lzma.LZMADecompressor(format=lzma.FORMAT_RAW,filters=filters).decompress(data[pq+5:end],max_length=maxlen)
+            return ("BCJ+lzma" if x86 else "lzma"),out
+        except lzma.LZMAError:
+            pass
+    if buf[:1]==b"1" and len(buf)>1 and buf[1]<14:
+        try:
+            return "bzip2",_nsis_bzip2().decompress(buf,max_length=maxlen)
+        except (ValueError,IndexError,ImportError):
+            pass
+    try:
+        return "deflate",zlib.decompressobj(-15).decompress(buf,maxlen)
+    except zlib.error:
+        return None
+
+def _nsis_header(data,start,end,hdrlen,errors):
+    """A header kibontasa. Visszaad: (header, solid, modszer, adatblokkok kezdete) vagy None"""
+    p=start+28
+    if hdrlen>NSIS_MAX_HEADER:
+        errors.append("NSIS header too big: %d"%(hdrlen))
+        return None
+    v=u32(data,p)
+    if v==hdrlen and p+4+hdrlen<=end:                  # nem solid, tarolt header
+        return data[p+4:p+4+hdrlen],False,"store",p+4+hdrlen
+    if v&0x80000000:                                   # nem solid, tomoritett header blokk
+        csize=v&0x7FFFFFFF
+        if p+4+csize<=end:
+            r=_nsis_decompress(data,p+4,p+4+csize,hdrlen)
+            if r and len(r[1])==hdrlen:
+                return r[1],False,r[0],p+4+csize
+    r=_nsis_decompress(data,p,end,hdrlen+4)             # solid
+    if r and len(r[1])==hdrlen+4 and struct.unpack_from("<I",r[1])[0]==hdrlen:
+        return r[1][4:],True,r[0],None
+    errors.append("NSIS header could not be decompressed")
+    return None
+
+class _NsisStrings:
+    def __init__(self,tab):
+        self.tab=tab
+        # Unicode (NSIS 3): a tabla ures stringgel kezdodik: 00 00
+        self.unicode=len(tab)>=2 and tab[0]==0 and tab[1]==0
+        if self.unicode:
+            self.codes={1:"lang",2:"shell",3:"var",4:"skip"}
+        else:
+            # ANSI: NSIS 2 kodok 252..255, NSIS 3 kodok 1..4 (a gyakoribb szamit)
+            n3=sum(tab.count(bytes([c])) for c in (1,2,3,4))
+            n2=sum(tab.count(bytes([c])) for c in (252,253,254,255))
+            self.codes={1:"lang",2:"shell",3:"var",4:"skip"} if n3>n2 else {255:"lang",254:"shell",253:"var",252:"skip"}
+
+    def var(self,n):
+        if n<10: return "$%d"%(n)
+        if n<20: return "$R%d"%(n-10)
+        if n-20<len(NSIS_VARS): return "$"+NSIS_VARS[n-20]
+        return "$_%d_"%(n-20-len(NSIS_VARS))
+
+    def get(self,off):
+        out=[]
+        tab=self.tab
+        if self.unicode:
+            i=off*2
+            while i+1<len(tab) and len(out)<4096:
+                c=tab[i]|(tab[i+1]<<8); i+=2
+                if c==0: break
+                kind=self.codes.get(c)
+                if kind and i+1<len(tab):
+                    n=(tab[i]|(tab[i+1]<<8))&0x7FFF; i+=2
+                    out.append(self._code(kind,n,n&0xFF,n>>8))
+                else:
+                    out.append(chr(c) if not 0xD800<=c<=0xDFFF else "\ufffd")
+        else:
+            i=off
+            while i<len(tab) and len(out)<4096:
+                c=tab[i]; i+=1
+                if c==0: break
+                kind=self.codes.get(c)
+                if kind and i+1<len(tab):
+                    b1,b2=tab[i],tab[i+1]; i+=2
+                    out.append(self._code(kind,(b1&0x7F)|((b2&0x7F)<<7),b1,b2))
+                else:
+                    out.append(bytes([c]).decode("cp1252","replace"))
+        return "".join(out)
+
+    def _code(self,kind,n,b1,b2):
+        if kind=="var": return self.var(n)
+        if kind=="lang": return "$(LSTR_%d)"%(n)
+        if kind=="shell":
+            name=NSIS_SHELL.get(b1&0x7F) or NSIS_SHELL.get(b2&0x7F)
+            return "$"+name if name else "$SHELL_%d"%(b1)
+        return chr(b1) if kind=="skip" else ""
+
+def nsis_details(data,start,end,errors):
+    flags,sig=unpack("<II",data,start)
+    hdrlen,arclen=unpack("<II",data,start+20)
+    h=_nsis_header(data,start,end,hdrlen,errors)
+    if h is None:
+        return None,False,None
+    hdr,solid,method,datastart=h
+    # header: flags + 8 blokk (offset,darab): pages, sections, entries, strings, langtables, ...
+    blocks=[struct.unpack_from("<II",hdr,4+8*i) for i in range(8)]
+    eoff,ecount=blocks[2]
+    soff=blocks[3][0]
+    if eoff+ecount*28>len(hdr) or soff>len(hdr):
+        errors.append("NSIS header block table invalid")
+        return None,False,None
+    strings=_NsisStrings(hdr[soff:])
+    files=[]
+    seen=set()
+    script={}
+    def cmd(k,v):
+        l=script.setdefault(k,[])
+        if v not in l and len(l)<NSIS_MAX_SCRIPT: l.append(v)
+    outdir="$INSTDIR"
+    for i in range(min(ecount,1000000)):
+        which,p0,p1,p2,p3,p4,p5=struct.unpack_from("<Iiiiiii",hdr,eoff+28*i)
+        if which==NSIS_EW_EXECUTE:
+            cmd("Exec",strings.get(p0))
+        elif which==NSIS_EW_SHELLEXEC:
+            cmd("ShellExec"," ".join(x for x in (strings.get(p0),strings.get(p1),strings.get(p2)) if x))
+        elif which==NSIS_EW_REGISTERDLL:
+            cmd("Plugin","%s::%s"%(strings.get(p0),strings.get(p1)))
+        if which==NSIS_EW_CREATEDIR and p1:            # SetOutPath
+            outdir=strings.get(p0)
+        elif which in (NSIS_EW_EXTRACTFILE,NSIS_EW_WRITEUNINSTALLER):
+            if which==NSIS_EW_WRITEUNINSTALLER:
+                # az uninstaller: a telepito exe resze + ez az adatblokk (parm0: nev, parm1: adat offset)
+                name=strings.get(p0); p2=p1
+            else:
+                name=strings.get(p1)
+            full=name if (name.startswith("$") or ":" in name[:3] or name.startswith("\\")) else outdir+"\\"+name
+            if full.startswith("$INSTDIR\\"): full=full[len("$INSTDIR\\"):]
+            full=full.replace("\\","/")
+            if (full,p2) in seen: continue            # a pluginokat minden hivas elott ujra kibontja: egyszer listazzuk
+            seen.add((full,p2))
+            size=packed=off=None; m=method
+            if not solid and datastart is not None:
+                b=datastart+p2
+                try:
+                    v=u32(data,b)
+                    if v&0x80000000:
+                        packed=v&0x7FFFFFFF
+                    else:
+                        size=packed=v; m="store"
+                    off=b+4-start
+                except struct.error:
+                    errors.append("NSIS data block of %r out of range"%(full))
+            files.append([full,size,packed,False,m,off,p2])
+            if len(files)>=MAX_FILES: break
+    if solid:
+        # solid: a kibontott streamben minden file elott u32 meret all; sorban olvasva kiolvashato
+        try:
+            rd=_nsis_decoder(data,start+28,end,method)
+            base=4+hdrlen
+            for e in sorted(files,key=lambda e:e[6]):
+                b=rd.read_at(base+e[6],4)
+                if b is None:
+                    errors.append("NSIS solid stream ends before %r"%(e[0])); break
+                e[1]=struct.unpack("<I",b)[0]
+        except Exception as ex:
+            errors.append("NSIS solid stream: %s"%(ex))
+    return [e[:6] for e in files],False,None,script or None
+
+ARCHIVE_DETAILS={"ZIP":zip_details,"RAR":rar4_details,"RAR14":rar14_details,"RAR5":rar5_details,"CAB":cab_details,"7z":sevenzip_details,
+                 "NSIS":nsis_details}
 
 
 #####################################################################
@@ -911,12 +1226,14 @@ def dump_archive(data):
     func=ARCHIVE_DETAILS.get(name)
     if func:
         try:
-            files,enc,comment=func(data,0,min(end,len(data)),r["errors"])
+            res=func(data,0,min(end,len(data)),r["errors"])
+            files,enc,comment=res[:3]
             r.update({"files":files,"encrypted":enc,"comment":comment})
+            if len(res)>3: r["sfx_script"]=res[3]         # NSIS: a telepito szkript parancsai
         except Exception as e:
             log(0,"exc:archive_listing %s: %r"%(name,e))
             r["errors"].append("%s listing error: %s"%(name,e))
-    if r["comment"]:
+    if r["comment"] and not r["sfx_script"]:
         r["sfx_script"]=parse_winrar_script(r["comment"])
     return r
 
