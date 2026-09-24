@@ -8,28 +8,24 @@ debug=False
 def log(level,text):
     if level>0 or debug: print(level,text)
 
-def unpack(fmt,f):
-#    l=struct.calcsize(fmt)
-#    data=f.read(l)
-#    print("l=%d  len(data)=%d"%(l,len(data)))
-#    return struct.unpack(fmt,data)
-    return struct.unpack(fmt,f.read(struct.calcsize(fmt)))
+def unpack(fmt,data,pos):
+    """struct.unpack a data[pos:] helyen; a kicsomagolt ertekek utan az uj poziciot is visszaadja."""
+    if pos<0:
+        raise struct.error("negative offset: %d"%(pos))
+    return struct.unpack_from(fmt,data,pos)+(pos+struct.calcsize(fmt),)
 
-def unp_cstr(f):
-    s=""
-    while 1:
-        #c,=unpack("c",f)
-        c=f.read(1)
-        try:
-            # python2
-            if len(c)!=1 or ord(c[0])==0:
-                return s
-            s+=c
-        except TypeError:
-            # python3
-            if len(c)!=1 or c[0]==0:
-                return s
-            s+=chr(c[0])
+def unp_cstr(data,pos):
+    """0-val lezart string olvasasa (vagy a data vegeig). Visszaad: (string, uj pozicio a 0 utan)"""
+    if pos<0:
+        raise ValueError("negative offset: %d"%(pos))
+    end=data.find(b"\0",pos)
+    if end<0:
+        end=max(pos,len(data))
+        return data[pos:end].decode("latin-1"),end
+    return data[pos:end].decode("latin-1"),end+1
+
+def printable(b,minc=32,maxc=None):
+    return "".join(chr(c) for c in b if c>=minc and (maxc is None or c<maxc))
 
 
 
@@ -40,209 +36,173 @@ dotnet_tab={0:"Module",1:"TypeRef",2:"TypeDef",4:"Field",6:"MethodDef",8:"Param"
     32:"Assembly",33:"AssemblyProcessor",34:"AssemblyOS",35:"AssemblyRef",36:"AssemblyRefProcessor",37:"AssemblyRefOS",
     38:"File",39:"ExportedType",40:"ManifestResource",41:"NestedClass",42:"GenericParam",44:"GenericParamConstraint"}
 
-def dotnet_parsemeta(zf,metalen):
-  metapos=zf.tell()
-  marker,version,reserved,verlen = unpack("<IIII",zf)
+def dotnet_parsemeta(data,pos,metalen):
+  metapos=pos
+  marker,version,reserved,verlen,pos = unpack("<IIII",data,pos)
   if marker!=0x424A5342:
     return
-  versionstr=zf.read(verlen).decode("us-ascii","ignore")
+  version=printable(data[pos:pos+verlen],32,128)
+  pos=min(pos+verlen,max(pos,len(data)))
 
-  version=""
-  for c in versionstr:
-            try:
-                if ord(c)>=32 and ord(c)<128:
-                    version+=c
-            except TypeError:
-                if c>=32 and c<128:
-                    version+=chr(c)  # python3
-
-  flags,streams = unpack("<HH",zf)
+  flags,streams,pos = unpack("<HH",data,pos)
   log(1,".NET Metadata %s flags=%d streams=%d len=%d"%(version,flags,streams,metalen))
   sections={}
   while streams>0:
-    s=zf.tell()
+    s=pos
     if s+12>metapos+metalen:
         return
-    s_off,s_size = unpack("<II",zf)
-    s_name=unp_cstr(zf)
-    l=zf.tell()-s
+    s_off,s_size,pos = unpack("<II",data,pos)
+    s_name,pos=unp_cstr(data,pos)
+    l=pos-s
     log(0,".NET SECT: %08X %5d '%s' %d"%(s_off,s_size,s_name,l))
     if l&3:
-      zf.read(4-(l&3)) # padding
+      pos+=4-(l&3) # padding
     streams-=1
     sections[s_name]=(s_off,s_size)
-#  zf.read(metapos+sections['#~'][0]-f.tell())
-  zf.seek(metapos+sections['#Strings'][0])
-  strings=zf.read(sections['#Strings'][1])
-#  print(len(strings))
-  zf.seek(metapos+sections['#~'][0])
-#  print("%08X"%(zf.tell()))
+  strpos=metapos+sections['#Strings'][0]
+  strings=data[strpos:strpos+sections['#Strings'][1]]
+  pos=metapos+sections['#~'][0]
   # metadata tables!
-  reserved,version,sizemask,onebyte = unpack("<IHBB",zf)
+  reserved,version,sizemask,onebyte,pos = unpack("<IHBB",data,pos)
   # sizemask:  &1=stringDWORD  &2=guidDQORD  &4=blobDWORD
-  validmask,sortedmask=unpack("<QQ",zf)
-  bit=0
-  mask=1
+  validmask,sortedmask,pos=unpack("<QQ",data,pos)
   tables={}
-  while bit<64:
-    if validmask&mask:
-      n=unpack("<I",zf)[0]
+  for bit in range(64):
+    if validmask&(1<<bit):
+      n,pos=unpack("<I",data,pos)
       tables[bit]=n
-      try:
+      if bit in dotnet_tab:
         log(0,"Table %d [%s]: %d"%(bit,dotnet_tab[bit],n))
-#        tables[dotnet_tab[bit]]=n
-      except:
+      else:
         log(0,"Table %d: %d"%(bit,n))
     else:
       tables[bit]=0
-    bit+=1
-    mask+=mask
 
   if not debug:
     return
 
-  tablerows=zf.tell()
+  def rd(fmt):
+    nonlocal pos
+    *vals,pos=unpack(fmt,data,pos)
+    return vals
+
+  def skip(n):
+    nonlocal pos
+    pos+=n
 
   def read_str():
-    if sizemask&1:
-      i=unpack("<Q",zf)[0]
-    else:
-      i=unpack("<H",zf)[0]
-#    if i>=len(strings): print("Str index: %d"%(i))
-    s=""
-    while i<len(strings):
-      c=strings[i]
-#      print(c)
-      try:
-        if ord(c)==0: break
-        if ord(c)>=32 and ord(c)<128: s+=c
-      except TypeError:
-        if c==0: break
-        if c>=32 and c<128: s+=chr(c)
-      i+=1
-#    print('"%s"'%s)
-    return s
+    i=rd("<Q" if sizemask&1 else "<H")[0]
+    end=strings.find(b"\0",i)
+    return printable(strings[i:] if end<0 else strings[i:end],32,128)
 
   guidsize=4 if sizemask&2 else 2
   blobsize=4 if sizemask&4 else 2
   ref_tables={}
 
-#  print("%08X reading Table 0: Module Table (%d)"%(zf.tell(),tables[0]))
+  # Table 0: Module
   for i in range(tables[0]):
-    x=unpack("<H",zf)
+    rd("<H")
     name=read_str()
-    zf.read(3*guidsize)
+    skip(3*guidsize)
 
-#  print("%08X reading Table 1: TypeRef Table (%d)"%(zf.tell(),tables[1]))
+  # Table 1: TypeRef
   ref_tables[1]=[]
   for i in range(tables[1]):
-    x=unpack("<H",zf)
+    rd("<H")
     name=read_str()
     namespace=read_str()
     ref_tables[1].append(namespace+"::"+name)
 
-#  print("%08X reading Table 2: TypeDef Table (%d)"%(zf.tell(),tables[2]))
+  # Table 2: TypeDef
   ref_tables[0]=[]
   for i in range(tables[2]):
-    x=unpack("<I",zf) # flags
+    rd("<I") # flags
     name=read_str()
     namespace=read_str()
     ref_tables[0].append(namespace+"::"+name)
-    unpack("<HHH",zf) # 3 index
+    rd("<HHH") # 3 index
 
-#  print("%08X reading Table 4: Field Table (%d)"%(zf.tell(),tables[4]))
+  # Table 4: Field
   for i in range(tables[4]):
-    x=unpack("<H",zf) # flags
+    rd("<H") # flags
     name=read_str()
-    zf.read(blobsize) # blob index
+    skip(blobsize) # blob index
 
-#  print("%08X reading Table 6: MethodDef Table (%d)"%(zf.tell(),tables[6]))
+  # Table 6: MethodDef
   ref_tables[3]=[]
   for i in range(tables[6]):
-    x=unpack("<I",zf) # RVA
-    x=unpack("<HH",zf) # implflags,flags
+    rd("<I") # RVA
+    rd("<HH") # implflags,flags
     name=read_str()
     ref_tables[3].append(name)
-    zf.read(blobsize) # blob index
-    unpack("<H",zf) # index
+    skip(blobsize) # blob index
+    rd("<H") # index
 
-#  print("%08X reading Table 8: Param Table (%d)"%(zf.tell(),tables[8]))
+  # Table 8: Param
   for i in range(tables[8]):
-    x=unpack("<HH",zf) # flags,seq
+    rd("<HH") # flags,seq
     name=read_str()
 
-#  print("%08X reading Table 9: InterfaceImpl Table (%d)"%(zf.tell(),tables[9]))
+  # Table 9: InterfaceImpl
   for i in range(tables[9]):
-    x=unpack("<HH",zf) # flags,seq
+    rd("<HH") # flags,seq
 
-#  print("%08X reading Table 10: MemberRef Table (%d)"%(zf.tell(),tables[10]))
+  # Table 10: MemberRef
+  MemberRefParent=["TypeDef","TypeRef","ModuleRef","MethodDef","TypeSpec","???","???","???"]
   for i in range(tables[10]):
-    x=unpack("<H",zf)[0] # class
-    MemberRefParent=["TypeDef","TypeRef","ModuleRef","MethodDef","TypeSpec","???","???","???"]
-#    print("%s[%d] = %s"%(MemberRefParent[x&7],x>>3,typeref_table[x>>3]))
+    x=rd("<H")[0] # class
     name=read_str()
     try:
       log(0,"%s[%d] = %s.%s"%(MemberRefParent[x&7],x>>3,ref_tables[x&7][x>>3],name))
-    except:
+    except (KeyError,IndexError):
       log(0,"%s[%d] = %s"%(MemberRefParent[x&7],x>>3,name))
-    zf.read(blobsize) # blob index
+    skip(blobsize) # blob index
 
 
 
 
 
 
-def dump_pe(f,startoff,exesize):
+def dump_pe(data,pos,exesize):
   dlllist=None
   dotnet=0
   try:
     # IMAGE_FILE_HEADER 0xD8
-    zero,arch,numsects, timedate,debug1,debug2, ophdrsize,charflags = unpack("<HHHLLLHH",f)
-#    print("PE arch=0x%04X  numsects=%d"%(arch,numsects))
-    start_oh=f.tell()
+    zero,arch,numsects, timedate,debug1,debug2, ophdrsize,charflags,pos = unpack("<HHHLLLHH",data,pos)
+    start_oh=pos
     # IMAGE_OPTIONAL_HEADER 0xF0
-    magic,lnkvers, size_code,size_data,size_bss,  rva1,rva2,  rva3,loadaddr=unpack("<HHLLLLLLL",f)
-    #print("magic=0x%X  opt_hdr_len=%d   size=%d+%d+%d"%(magic,ophdrsize,  size_code,size_data,size_bss))
+    magic,lnkvers, size_code,size_data,size_bss,  rva1,rva2,  rva3,loadaddr,pos=unpack("<HHLLLLLLL",data,pos)
     if magic!=0x20B and magic!=0x10B:
         log(0,"Bad PE OH MAGIC number: 0x%02X"%(magic))
-    sect_align,file_align,os_ver,bin_ver,subsys_ver,win32_ver=unpack("<LLLLLL",f)
-    image_size,header_size,CRC, subsys,dllchr=unpack("<LLLHH",f)
+    sect_align,file_align,os_ver,bin_ver,subsys_ver,win32_ver,pos=unpack("<LLLLLL",data,pos)
+    image_size,header_size,CRC, subsys,dllchr,pos=unpack("<LLLHH",data,pos)
     if arch==0x14c:
         log(0,"32-bit PE-EXE detected!")
         if magic!=0x10B:
             log(0,"Bad PE OH magic: 0x%02X"%(magic))
         if ophdrsize!=224:
             log(0,"Bad PE OH size: %d"%(ophdrsize))
-        stack_rvd,stack_com,heap_rvd,heap_com=unpack("<LLLL",f)
+        stack_rvd,stack_com,heap_rvd,heap_com,pos=unpack("<LLLL",data,pos)
     elif arch==0x8664:
         log(0,"64-bit PE-EXE detected!")
         if magic!=0x20B:
             log(0,"Bad PE OH magic: 0x%02X"%(magic))
         if ophdrsize!=240:
             log(0,"Bad PE OH size: %d"%(ophdrsize))
-        stack_rvd,stack_com,heap_rvd,heap_com=unpack("<QQQQ",f)
+        stack_rvd,stack_com,heap_rvd,heap_com,pos=unpack("<QQQQ",data,pos)
     else:
         log(0,"Unknown format PE-EXE detected! arch=0x%02X ohmagic=%02X ohlen=%d"%(arch,magic,ophdrsize))
-    loader_flags,num_dirent=unpack("<LL",f)
+    loader_flags,num_dirent,pos=unpack("<LL",data,pos)
     # IMAGE_DATA_DIRECTORYs
     img_dir_entries=[]
     for i in range(0,16):
-        tmp=unpack("<2L",f)
-        img_dir_entries.append(tmp)
-    #print("OH size: %d / %d"%(f.tell()-start_oh,ophdrsize))
+        *tmp,pos=unpack("<2L",data,pos)
+        img_dir_entries.append(tuple(tmp))
     # SECTIONS:
     sections=[]
     for sno in range(numsects):
-        sect_name,tmp,rva,rawsize,fileoff,ptr_reloc,ptr_lno,num_reloc,num_lno,flags=unpack("<8sLLLLLLHHL",f)
-#        print(sect_name)
-        name=""
-        for c in sect_name:
-            try:
-                if ord(c)>=32:
-                    name+=c
-            except TypeError:
-                if c>=32:
-                    name+=chr(c)  # python3
+        sect_name,tmp,rva,rawsize,fileoff,ptr_reloc,ptr_lno,num_reloc,num_lno,flags,pos=unpack("<8sLLLLLLHHL",data,pos)
+        name=printable(sect_name)
         #     0      1       2     3    4
         tmp=(name,rawsize,fileoff,rva,flags)
         sections.append(tmp)
@@ -254,7 +214,6 @@ def dump_pe(f,startoff,exesize):
             exesize=fileoff+rawsize
 
     def rva_to_file(rva,sections):
-#        print("0x%X"%(rva))
         for sect in sections:
             if rva>=sect[3] and rva<sect[3]+sect[1]:
                 return sect[2]+(rva-sect[3])
@@ -266,13 +225,11 @@ def dump_pe(f,startoff,exesize):
         nethdr_pos=rva_to_file(tmp[0],sections)
         log(0,"MS .NET binary detected! header pos=0x%X len=%d" % (nethdr_pos,tmp[1]))
         try:
-          f.seek(startoff+nethdr_pos,0)
-          hdrlen,ver1,ver2,metadata_rva,metadata_len=unpack("<IHHII",f) # 16 bytes
+          hdrlen,ver1,ver2,metadata_rva,metadata_len,_=unpack("<IHHII",data,nethdr_pos) # 16 bytes
           metadata_pos=rva_to_file(metadata_rva,sections)
           log(0,".NET header: v%d.%d  MetaData: fpos=0x%X len=%d"%(ver1,ver2,metadata_pos,metadata_len))
-          f.seek(startoff+metadata_pos,0)
-          dotnet_parsemeta(f,metadata_len)
-        except:
+          dotnet_parsemeta(data,metadata_pos,metadata_len)
+        except Exception:
           log(3,"Exception!!! while .NET parsing: %s" % (traceback.format_exc()))
 
     tmp=img_dir_entries[1]
@@ -280,24 +237,19 @@ def dump_pe(f,startoff,exesize):
         fpos=rva_to_file(tmp[0],sections)
         if fpos:
             # we have imports! load 'em all!
-            f.seek(startoff+fpos,0)
             imps=[]
             while 1:
-                imp=unpack("<LLLLL",f)
+                *imp,fpos=unpack("<LLLLL",data,fpos)
                 if (imp[0]==0 or imp[3]==0) and imp[4]==0:
                     break
                 imps.append(imp)
-#                print(imp)
             dlllist=[]
             for imp in imps:
                 dllentry=[""]
                 # read DLL name:
                 fpos=rva_to_file(imp[3],sections)
-#                print(fpos)
                 if fpos:
-                    f.seek(startoff+fpos,0)
-                    dllentry[0]=unp_cstr(f)
-#                    print "DLL: "+dllentry[0]
+                    dllentry[0],_=unp_cstr(data,fpos)
                 # dump symbols:
                 if imp[0]:
                     fpos=rva_to_file(imp[0],sections)
@@ -305,91 +257,75 @@ def dump_pe(f,startoff,exesize):
                     fpos=rva_to_file(imp[4],sections)
                 if fpos:
                   try:
-#                    print fpos
-                    f.seek(startoff+fpos,0)
-#                    print("fpos=0x%X  dll=%s"%(startoff+fpos,dllentry[0]))
+                    symfmt="<Q" if arch==0x8664 else "<L"  # 64/32 bit
                     syms=[]
                     while 1:
-                        if arch==0x8664:
-                            tmp,=unpack("<Q",f) # 64 bit
-                        else:
-                            tmp,=unpack("<L",f) # 32 bit
-                        if tmp==0:
+                        sym,fpos=unpack(symfmt,data,fpos)
+                        if sym==0:
                             break
-                        syms.append(tmp)
-#                    print syms
+                        syms.append(sym)
                     for sym in syms:
                         if sym<0x80000000:
                             fpos=rva_to_file(sym,sections)
                             if fpos:
-                                f.seek(startoff+fpos,0)
-                                tmp=unpack("<H",f)
-                                dllentry.append(unp_cstr(f))
+                                hint,fpos=unpack("<H",data,fpos)
+                                dllentry.append(unp_cstr(data,fpos)[0])
                         else:
                             dllentry.append("0x%X"%(sym&0x7FFFFFFF))
-                  except:
+                  except Exception:
                     log(3,"error parsing DLL info at 0x%08X" % (fpos))
                 dlllist.append(dllentry)
-  except:
+  except Exception:
     log(3,"Exception!!! while PE-EXE parsing: %s" % (traceback.format_exc()))
-#    traceback.print_exc()
   return ("PE",exesize,dlllist,dotnet)
 
 
 # 4C 01 03 00 │ 00 00 00 00 │ 00 00 00 00 │ 00 00 00 00 │ 1C 00 0F 01 │ 0B 01 00 00 │ 58 BB 02 00 │ 00 30 00 00 │ 00 CE 00 00  L.......................X....0......
-def dump_coff(f,hdr):
+def dump_coff(data,pos,hdr):
     hdr2len=hdr[16]+hdr[17]*256
-    hdr2=f.read(hdr2len)
-    if len(hdr2)!=hdr2len: return 0 # bad
-    sn=0
+    if len(data[pos:pos+hdr2len])!=hdr2len: return 0 # bad
+    pos+=hdr2len
     coffsize=20+hdr2len
     # read sections!
-    while sn<hdr[2]:
-        sn+=1
-        sect=f.read(40)
+    for sn in range(hdr[2]):
+        sect=data[pos:pos+40]
+        pos+=40
         size=sect[16]+(sect[17]<<8)+(sect[18]<<16)+(sect[19]<<24)
         fpos=sect[20]+(sect[21]<<8)+(sect[22]<<16)+(sect[23]<<24)
         if fpos and fpos+size>coffsize: coffsize=fpos+size
-#        print(sn,fpos,size,sect[:8])
     return coffsize
 
-def dump_exe(f):
-    startoff=f.tell()
+def dump_exe(data):
+    """data: a teljes file tartalma (bytes). Visszaad: None vagy (tipus, exe_meret[, dlllist, dotnet])"""
     try:
-        MZ,=unpack("<H",f)
+        MZ,_=unpack("<H",data,0)
         if not MZ in (0x5A4D,0x4D5A):
             return None
 # 4D 5A 26 01   1E 00 01 00   06 00 88 0C   FF FF 00 00   40 5E 00 00   00 01 F0 FF   52 00 00 00 
 # M  Z  size_l size_h relocs hdrsize allmin/max   SS      SP    CRC     IP    CS     reloff  ovl
-        size_l,size_h,relocs,hdrsize,allocmin,allocmax,SS,SP,CRC,IP,CS,relocoff,ovl = unpack("<13H",f)
+        size_l,size_h,relocs,hdrsize,allocmin,allocmax,SS,SP,CRC,IP,CS,relocoff,ovl,_ = unpack("<13H",data,2)
         if size_l>512 or size_h==0:
             log(1,"invalid MZ file, probably text? (size=%d,%d)"%(size_l,size_h))
             return None
-    except:
+    except Exception:
         log(3,"Exception!!! while MZ-EXE parsing: %s" % (traceback.format_exc()))
         return None
     size=size_h*512
     if size_l:
         size+=size_l-512
-#    if relocoff>=0x40:
     try:
         # coff:
         if size<32768:
-            f.seek(startoff+size)
-            coff=f.read(20)
+            coff=data[size:size+20]
             if len(coff)==20 and coff[0]==0x4C and coff[1]==1 and coff[2]>0 and coff[3]==0:
-                coffsize=dump_coff(f,coff)
-#                print(hex(startoff),hex(size),hex(coffsize))
-                if coffsize: return "COFF",startoff+size+coffsize
+                coffsize=dump_coff(data,size+20,coff)
+                if coffsize: return "COFF",size+coffsize
         # new-exe:
-        f.seek(startoff+0x3c)
-        ne_off,=unpack("<L",f)
-        log(0,"NE start pos: %d+%d"%(startoff,ne_off))
-        f.seek(startoff+ne_off)
-        NE,=unpack("<H",f)
-#        print("NE=%X"%(NE))
+        ne_off,_=unpack("<L",data,0x3c)
+        log(0,"NE start pos: %d+%d"%(0,ne_off))
+        NE,pos=unpack("<H",data,ne_off)
         if NE==0x4550:
-            return dump_pe(f,startoff,size)
+            return dump_pe(data,pos,size)
         if NE==0x454E:
             # win 3.1 (16-bit) EXE (FIXME: parse out size!)
             return ("NE",size)
@@ -399,21 +335,102 @@ def dump_exe(f):
         if NE==0x454C:
             # dos4gw/watcom: (FIXME: parse out size!)
             return ("LE",size)
-    except:
+    except Exception:
         log(3,"Exception!!! while NE-EXE parsing: %s" % (traceback.format_exc()))
-        NE=0
     return ("MZ",size)
 
 
-if __name__ == '__main__':
-  import sys
-  path=sys.argv[1]
-  debug=True
-  f=open(path,"rb")
-  ret=dump_exe(f)
-  print(ret, hex(ret[1]))
-  f.seek(ret[1])
-  data=f.read()
-  print(data[:32])
-  open(path+".dump","wb").write(data)
+def iter_files(paths):
+    """A megadott fileokat es konyvtarakat (rekurzivan) sorban bejarja."""
+    import os
+    for path in paths:
+        if os.path.isdir(path):
+            for root,dirs,files in os.walk(path):
+                dirs.sort()
+                for name in sorted(files):
+                    yield os.path.join(root,name)
+        else:
+            yield path
 
+def run_one(path):
+    """Egy file vizsgalata. Visszaadja: (eredmeny, log szoveg)."""
+    import io, contextlib
+    out=io.StringIO()
+    with open(path,"rb") as f:
+        data=f.read()
+    with contextlib.redirect_stdout(out):
+        ret=dump_exe(data)
+    return ret,out.getvalue()
+
+def to_json(ret):
+    # tuple -> list, hogy a JSON-bol visszaolvasott ertekkel osszevetheto legyen
+    if isinstance(ret,(tuple,list)):
+        return [to_json(x) for x in ret]
+    return ret
+
+def log_summary(text):
+    # traceback sorszamok/kodsorok nelkul, hogy atiras utan is osszevetheto legyen
+    return [l for l in text.splitlines() if not l.startswith("  ")]
+
+def short(ret):
+    if ret is None: return "None"
+    s="%s size=0x%X"%(ret[0],ret[1])
+    if len(ret)>2:
+        dlls=ret[2]
+        s+=" dotnet=%d dlls=%s"%(ret[3],"None" if dlls is None else len(dlls))
+        if dlls: s+=" [%s]"%(", ".join(d[0] for d in dlls))
+    return s
+
+
+if __name__ == '__main__':
+  import sys, json, argparse
+  ap=argparse.ArgumentParser(description="DOS/Windows EXE elemzo es tesztelo")
+  ap.add_argument("paths",nargs="+",help="vizsgalando fileok/konyvtarak")
+  ap.add_argument("-v","--verbose",action="store_true",help="debug log")
+  ap.add_argument("-s","--save",metavar="JSON",help="eredmenyek mentese")
+  ap.add_argument("-c","--compare",metavar="JSON",help="osszevetes korabbi eredmennyel")
+  ap.add_argument("-x","--extract",action="store_true",help="exe utani adat kiirasa <file>.dump-ba")
+  args=ap.parse_args()
+  debug=args.verbose
+
+  results={}
+  ref=json.load(open(args.compare)) if args.compare else None
+  nfail=nlogdiff=nmissing=0
+  for path in iter_files(args.paths):
+    try:
+      ret,logtext=run_one(path)
+    except Exception:
+      ret,logtext="CRASH",traceback.format_exc()
+    if debug and logtext: sys.stdout.write(logtext)
+    r={"result":to_json(ret),"log":log_summary(logtext)}
+    results[path]=r
+    status=""
+    if ref is not None:
+      if path not in ref:
+        status="NEW "; nmissing+=1
+      elif ref[path]["result"]!=r["result"]:
+        status="FAIL "; nfail+=1
+      elif ref[path]["log"]!=r["log"]:
+        status="LOGDIFF "; nlogdiff+=1
+      else:
+        status="OK "
+    print("%s%s: %s"%(status,path,short(ret) if ret!="CRASH" else "CRASH"))
+    if status=="FAIL ":
+      print("   expected: %s"%(ref[path]["result"],))
+      print("   got:      %s"%(r["result"],))
+    if status=="LOGDIFF ":
+      print("   expected log: %s"%(ref[path]["log"],))
+      print("   got log:      %s"%(r["log"],))
+    if args.extract and ret and ret!="CRASH":
+      with open(path,"rb") as f:
+        data=f.read()[ret[1]:]
+      if data:
+        open(path+".dump","wb").write(data)
+
+  if args.save:
+    with open(args.save,"w") as f:
+      json.dump(results,f,indent=1,ensure_ascii=False,sort_keys=True)
+  if ref is not None:
+    gone=[p for p in ref if p not in results and any(p.startswith(a.rstrip("/")) for a in args.paths)]
+    print("\n%d file: %d OK, %d FAIL, %d LOGDIFF, %d NEW, %d MISSING"%(len(results),len(results)-nfail-nlogdiff-nmissing,nfail,nlogdiff,nmissing,len(gone)))
+    sys.exit(1 if nfail or gone else 0)
