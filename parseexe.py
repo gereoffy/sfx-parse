@@ -51,6 +51,8 @@ def log(level,text):
 
 MAX_DLLS=4096      # vedelem a hibas/rosszindulatu fileok ellen
 MAX_SYMS=65536
+MAX_ERRORS=100     # ennyi hibauzenet kerul az errors listaba, a tobbit csak szamoljuk
+MAX_BAD_IMPORT_NAMES=32   # ennyi egymas utani ervenytelen import nev utan feladjuk az adott DLL-t
 
 def unpack(fmt,data,pos):
     if pos is None or pos<0:
@@ -171,10 +173,14 @@ class PEParser:
         self.data=data
         self.pe_off=pe_off
         self.errors=[]
+        self.suppressed=0
 
     def error(self,text):
-        log(0,"ERROR: "+text)
-        self.errors.append(text)
+        if len(self.errors)<MAX_ERRORS:
+            log(0,"ERROR: "+text)
+            self.errors.append(text)
+        else:
+            self.suppressed+=1
 
     def rva2off(self,rva):
         """RVA -> file offset, None ha nincs a fileban (pl. .bss, vagy ervenytelen)."""
@@ -199,6 +205,7 @@ class PEParser:
         if self.bits==64: fmt,step,ordflag="<Q",8,1<<63
         else: fmt,step,ordflag="<I",4,1<<31
         syms=[]
+        bad=0
         while len(syms)<MAX_SYMS:
             v,=unpack(fmt,data,off)
             off+=step
@@ -210,8 +217,12 @@ class PEParser:
                 if o is None:
                     self.error("import name RVA 0x%X not in file"%(v))
                     syms.append("?0x%X"%(v))
+                    bad+=1
+                    if bad>=MAX_BAD_IMPORT_NAMES:
+                        raise struct.error("too many invalid import names, thunk table is probably garbage")
                 else:
                     syms.append(cstr(data,o+2)) # hint + nev
+                    bad=0
         return syms
 
     def parse_imports(self,rva,size):
@@ -428,6 +439,8 @@ class PEParser:
         rva,dsize=dirs[14]
         if rva and dsize>=16:
             r["dotnet"]=self.parse_dotnet(rva)
+        if self.suppressed:
+            self.errors.append("... %d more errors suppressed"%(self.suppressed))
         r["errors"]=self.errors
         return r
 
